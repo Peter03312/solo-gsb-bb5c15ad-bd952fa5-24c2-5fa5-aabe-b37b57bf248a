@@ -169,6 +169,11 @@ class PendingItem(BaseModel):
     occurred_at: datetime
     amount: int
     reason: str
+    # 待处理原因：no_agreement=缺适用协议；disputed=更正链计费争议暂缓
+    # （两者并存时以争议为先，争议链整链不计应付）
+    reason_code: str = "no_agreement"
+    # reason_code=disputed 时为未解除争议号，其余为 None
+    dispute_ref: str | None = None
 
 
 class StatementLineOut(BaseModel):
@@ -625,6 +630,46 @@ class BalanceSnapshotPage(BaseModel):
     records: list[BalanceSnapshotLine]
     # 全快照口径总计（不随分页变化；空快照各项为 0）
     totals: BalanceSnapshotTotals
+
+
+# ---- 播放更正链计费争议（暂缓/解除）----
+
+class PlayDisputeIn(BaseModel):
+    # 链内任一播放编号（原始记录或任一更正记录均可；未知编号 404 play_not_found）
+    play_import_id: str = Field(min_length=1, max_length=200)
+    # 调用方唯一争议号（全局唯一；同号同内容重试幂等、异内容 409）
+    dispute_ref: str = Field(min_length=1, max_length=200)
+    # 暂缓原因（原样保存并随查询/操作记录返回）
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class PlayDisputeOperation(BaseModel):
+    # opened=登记暂缓；released=解除（幂等重试与被拒绝请求不留操作记录）
+    operation: str
+    # 开启时为登记用播放编号；解除记录沿用开启时的编号
+    play_import_id: str
+    reason: str
+    at: datetime
+
+
+class PlayDisputeOut(BaseModel):
+    dispute_ref: str
+    # 更正链原始编号（暂缓以原始编号锚定整条链）
+    root_import_id: str
+    # 登记时实际给出的链内播放编号
+    anchor_import_id: str
+    # 查询/响应时点的当前链尾（暂缓后新增更正自动继承暂缓，链尾前移）
+    current_tail_import_id: str
+    # 请求级状态：created=本次开启；released=本次解除；
+    # duplicate=同号同内容重试或重复解除；查询时与 dispute_status 一致
+    status: str
+    # 争议自身状态：open=暂缓中 | released=已解除
+    dispute_status: str
+    reason: str
+    opened_at: datetime
+    released_at: datetime | None = None
+    # 开启/解除操作记录（按发生次序，只追加）
+    operations: list[PlayDisputeOperation] = []
 
 
 # 解析 HolderLedger 中对 LedgerInstructionItem 的前向引用

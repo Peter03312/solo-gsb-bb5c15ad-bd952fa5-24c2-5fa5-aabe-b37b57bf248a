@@ -113,6 +113,35 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 按快照号 **分页读取冻结明细（按权利人编号升序）与全快照各项总计**
     （总计不随分页变化，页超范围返回空记录）；**未知快照号 404**
     `balance_snapshot_not_found`；现有余额、付款与对账接口 **完全兼容**。
+- **播放更正链计费争议（财务暂缓/解除整条链）**：
+  - 财务发现某条播放更正链的计费依据存疑时，可凭 **链内任一播放编号
+    `play_import_id`、调用方唯一争议号 `dispute_ref` 与原因 `reason`**
+    登记暂缓（201）；以更正链 **原始编号锚定、作用于整条链**，
+    返回原始编号、登记用编号、当前链尾、状态、原因与操作记录；
+  - **暂缓期间试算与出单把当前链尾列为"争议待处理"**
+    （`reason_code="disputed"`、回带 `dispute_ref`），**整链不计应付**；
+    暂缓后新增的更正 **自动继承** 暂缓；**缺协议与争议并存时以争议为先**
+    （原因文案不再是缺协议，而是争议待处理）；
+  - **已出具单据与归因保持冻结**：暂缓不改写任何历史单据；暂缓期间再出单
+    按 **现有追补规则** 出具负额追补撤销该链已计金额（`removed` 负额保留，
+    争议链无 `added`）；
+  - **凭争议号解除**：`open → released` 幂等（重复解除 200 `duplicate`）；
+    解除后试算/出单 **按最新链尾与适用协议恢复**，**缺协议仍待处理**；
+    恢复后 **应付无变化不产生新单**；**解除后可用新争议号重开**
+    （旧争议号同内容重试仍返回原已解除结果，不复活）；
+  - 同号 **同内容重试返回原结果**（200 `duplicate`，不改变状态，内容按
+    "解析后的更正链 + 原因"判定，链内任一编号重试都算同内容）；
+    **异内容复用 409** `dispute_ref_conflict`、**未知播放 404**
+    `play_not_found`、**同链重复开启未解除争议 409** `dispute_already_open`
+    （使用新争议号同样拒绝，**拒绝不改变状态、不留记录**）；
+    未知争议号解除/查询 404 `play_dispute_not_found`；
+  - **并发一致性**：争议操作按「争议号事务咨询锁 → 链根事务咨询锁」、
+    出单按「期间事务咨询锁 → 期间内全部链根咨询锁（按原始编号升序）」加锁，
+    暂缓/解除与出单在同一链上 **基于一致的已提交状态串行**，
+    **不重复出单、不漏算/错算**；试算（preview）只读，展示调用瞬间已提交状态；
+  - 争议头与开启/解除操作记录 **只追加、不可修改/删除**（触发器强制，
+    唯一允许的变更是 open → released）；现有播放导入、更正、出单与付款
+    **接口契约保持不变**（待处理项仅新增 `reason_code`/`dispute_ref` 字段）。
 
 ## 一键启动
 
@@ -236,6 +265,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | POST | `/balance-snapshots` | 凭唯一快照号 + 权利人编号集合（空集合/省略＝全体）冻结底稿；新冻结 201，同号同集合重试 200，异集合 409 |
 | GET | `/balance-snapshots/{snapshot_no}` | 按快照号分页读取冻结明细（`page`/`page_size`）及全快照各项总计；未知快照号 404 |
+
+### 播放更正链计费争议（暂缓/解除）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/play-disputes` | 凭链内任一播放编号 + 唯一争议号 + 原因登记暂缓（整链）；新登记 201，同号同内容重试 200，异内容 409，未知播放 404，同链重复开启 409 |
+| POST | `/play-disputes/{dispute_ref}/release` | 凭争议号解除；重复解除幂等 200；未知争议号 404 |
+| GET | `/play-disputes/{dispute_ref}` | 查询：原始编号、登记编号、当前链尾、状态、原因与开启/解除操作记录；未知争议号 404 |
 
 `POST /payments` 请求体：
 
@@ -807,6 +844,67 @@ curl -sS "http://localhost:8000/balance-snapshots/BAL-CLOSE-20260331" \
   | python3 -m json.tool
 ```
 
+财务对播放更正链的计费依据登记争议暂缓（独立演示作品 W-DISP-001，RS-A 70% / RS-B 30%）：
+
+```bash
+# 自包含演示脚本：登记/暂缓/试算/出单/更正继承/幂等拒绝/解除/恢复 全流程
+BASE=http://localhost:8000 bash examples/disputes_demo.sh
+```
+
+手工调用关键几步：
+
+```bash
+PERIOD='{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}'
+
+# 1) 登记暂缓：链内任一播放编号 + 唯一争议号 + 原因（返回 root/当前链尾/状态/操作记录）
+curl -sS -X POST http://localhost:8000/play-disputes -H 'Content-Type: application/json' \
+  -d '{"play_import_id":"PLAY-D-1","dispute_ref":"DSP-DEMO-1",
+       "reason":"播放量来源待第三方核账"}' | python3 -m json.tool
+# => 201 status=created，dispute_status=open，
+#    root_import_id 为更正链原始编号，current_tail_import_id 为当前链尾
+
+# 2) 暂缓期间试算：链尾 reason_code=disputed、dispute_ref=DSP-DEMO-1，payable 为空
+curl -sS "http://localhost:8000/statements/preview?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" \
+  | python3 -m json.tool
+
+# 3) 暂缓期间出单：初次单无应付；已入账后再开争议则再出单按追补规则撤销（removed 负额）
+curl -sS -X POST http://localhost:8000/statements/issue \
+  -H 'Content-Type: application/json' -d "$PERIOD" | python3 -m json.tool
+
+# 4) 暂缓后导入新更正（链尾前移）：自动继承暂缓；查询实时返回新链尾
+curl -sS -X POST http://localhost:8000/plays/import -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-D-1-R1","work_code":"W-DISP-001",
+       "occurred_at":"2026-02-10T20:00:00+08:00","amount":80,
+       "corrects_id":"PLAY-D-1"}'
+curl -sS http://localhost:8000/play-disputes/DSP-DEMO-1 | python3 -m json.tool
+
+# 5) 同号同内容重试 => 200 duplicate（用链内其它编号重试也算同内容，状态不变）；
+#    同链未解除重复开启（即使换新争议号）=> 409 dispute_already_open；
+#    同号异原因/异链 => 409 dispute_ref_conflict；未知播放 => 404 play_not_found
+curl -sS -i -X POST http://localhost:8000/play-disputes -H 'Content-Type: application/json' \
+  -d '{"play_import_id":"PLAY-D-1","dispute_ref":"DSP-DEMO-1",
+       "reason":"播放量来源待第三方核账"}' | head -1
+curl -sS -i -X POST http://localhost:8000/play-disputes -H 'Content-Type: application/json' \
+  -d '{"play_import_id":"PLAY-D-1-R1","dispute_ref":"DSP-DEMO-2","reason":"重复开启"}' | head -1
+
+# 6) 凭争议号解除（重复解除幂等 200 duplicate；未知争议号 404）
+curl -sS -X POST http://localhost:8000/play-disputes/DSP-DEMO-1/release | python3 -m json.tool
+curl -sS -i -X POST http://localhost:8000/play-disputes/NOPE/release | head -1
+
+# 7) 解除后：按最新链尾(80=>56/24)与协议恢复；缺协议仍进 pending(no_agreement)；
+#    再出单按追补入账，应付无变化不产生新单；之后可用新争议号重开
+curl -sS "http://localhost:8000/statements/preview?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" \
+  | python3 -m json.tool
+curl -sS -X POST http://localhost:8000/statements/issue \
+  -H 'Content-Type: application/json' -d "$PERIOD" | python3 -m json.tool
+```
+
+待处理清单（试算与单据的 `pending[]`）在原有字段上新增两个字段，旧调用方不受影响：
+
+- `reason_code`：`no_agreement`（缺适用协议，原有口径）或 `disputed`（更正链争议暂缓）；
+- `dispute_ref`：`disputed` 时为未解除争议号，其余为 `null`。
+  **缺协议与争议并存时以争议为先**（该链尾只以 `disputed` 出现一次）。
+
 财务收到银行退票时，凭原付款流水号登记退回（承上：RS-B 的 BANK-20260302-0002 已付 9 分）：
 
 ```bash
@@ -927,7 +1025,12 @@ python3 -m unittest discover -s tests -v
 付款退回与复核并发快照一致/核验不改写账务）、余额核对底稿冻结
 （指定集合与全体/空库零总计/编号重复与权利人不存在整拒不留痕/
 同号同集合幂等同号异集合 409/与出单付款退票预留确认取消并发不混合前后状态/
-同号并发恰一笔/后续流水与新建权利人不改历史/触发器不可变/分页与总计）
+同号并发恰一笔/后续流水与新建权利人不改历史/触发器不可变/分页与总计）、
+播放更正链计费争议暂缓（链内任一编号锚定原始链/同号同内容幂等同号异内容 409/
+未知播放 404/同链重复开启 409 状态不变/重复解除幂等/解除后新号重开/
+暂缓整链争议待处理不计应付且后续更正继承/争议优先于缺协议/
+已出单据与归因冻结再出单追补撤销/解除后按最新链尾恢复无变化不出新单/
+争议操作与出单并发基于一致已提交状态不重复出单不漏算）
 各有一套：
 
 ```bash
@@ -939,6 +1042,7 @@ PYTHONPATH=. python3 tests/integration_reservations.py          # 付款额度�
 PYTHONPATH=. python3 tests/integration_refunds.py               # 银行退票登记与回单退回额冻结
 PYTHONPATH=. python3 tests/integration_receipts.py              # 银行回单批次导入与付款核验
 PYTHONPATH=. python3 tests/integration_balance_snapshots.py     # 余额核对底稿一次性冻结
+PYTHONPATH=. python3 tests/integration_disputes.py              # 播放更正链计费争议暂缓/解除
 ```
 
 ## 目录结构
@@ -956,9 +1060,11 @@ app/
   refunds_service.py      # 银行退票登记（退回流水号锁 + 原付款行锁 + 权利人行锁，累计超额拒绝/幂等冲突）
   receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论与累计退回额冻结、复核版本化
   balance_snapshots_service.py  # 余额核对底稿一次性冻结（快照号锁 + 单语句已提交视图；同集合幂等/异集合拒绝、分页）
+  disputes_service.py     # 播放更正链计费争议（争议号锁→链根锁；登记暂缓/解除幂等/同链重复开启拒绝；链锚定整链）
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
+    play_disputes.py      # 播放更正链计费争议：登记暂缓 / 解除 / 查询
     statements.py         # 单据出具、试算、查询、逐笔归因分页查询
     payments.py           # 付款登记、按权利人对账
     reservations.py       # 付款额度预留：创建 / 确认 / 取消 / 单条查询
@@ -966,6 +1072,7 @@ app/
     receipts.py           # 回单批次导入、复核、版本查询
     balance_snapshots.py  # 余额核对底稿：冻结 / 分页读取
 examples/demo.sh          # 端到端 curl 示例（含付款额度预留两阶段与负额追补 FIFO）
-tests/                    # 单元测试与七套 pgserver 端到端集成测试
+examples/disputes_demo.sh # 播放更正链计费争议暂缓/解除端到端 curl 示例
+tests/                    # 单元测试与八套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

@@ -464,6 +464,114 @@ CREATE TRIGGER receipt_verification_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON receipt_verification_lines
     FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
 
+-- 播放更正链计费争议（财务暂缓/解除）：
+-- 财务发现某条播放更正链的计费依据存疑时，可凭"链内任一播放编号
+-- anchor_import_id + 调用方唯一争议号 dispute_ref + 原因 reason"登记暂缓。
+-- 暂缓以更正链"原始编号"(root_import_id) 锚定，作用于整条链：
+-- 无论当前链尾还是暂缓后新增的更正，链在暂缓期间一律列为争议待处理、不计应付。
+--   open     暂缓中：同一链至多一条（部分唯一索引强制；同链重复开启 409）
+--   released 已解除：终态，只允许 open -> released（触发器强制，凭争议号解除）；
+--                    解除后同一争议号不复活，可用"新争议号"对同链重新开启。
+-- dispute_ref 全局唯一：同号同内容重试幂等返回原争议，同号异内容 409。
+CREATE TABLE IF NOT EXISTS play_disputes (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dispute_ref      text NOT NULL UNIQUE,
+    root_import_id   text NOT NULL REFERENCES plays(import_id),
+    -- 登记时调用方实际给出的链内播放编号（原始/中间更正/链尾均可）
+    anchor_import_id text NOT NULL,
+    reason           text NOT NULL,
+    status           text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'released')),
+    opened_at        timestamptz NOT NULL DEFAULT now(),
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    released_at      timestamptz
+);
+-- 一条更正链至多一条未解除争议（并发出/重复开启在此兜底，正常路径行锁下先行拒绝）
+CREATE UNIQUE INDEX IF NOT EXISTS play_disputes_one_open_per_chain
+    ON play_disputes(root_import_id)
+    WHERE status = 'open';
+-- 出单/试算按链原始编号关联当前未解除争议的主查询索引
+CREATE INDEX IF NOT EXISTS play_disputes_root_open_idx
+    ON play_disputes(root_import_id, status);
+
+-- 争议操作记录（只追加）：开启与解除各至多一条（按事件类型去重），
+-- 幂等重试/被拒绝请求不产生记录。解除记录的 reason/anchor 沿用开启时的内容。
+CREATE TABLE IF NOT EXISTS play_dispute_events (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dispute_id     bigint NOT NULL REFERENCES play_disputes(id),
+    event_type     text NOT NULL CHECK (event_type IN ('opened', 'released')),
+    play_import_id text NOT NULL,
+    reason         text NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (dispute_id, event_type)
+);
+CREATE INDEX IF NOT EXISTS play_dispute_events_dispute_idx
+    ON play_dispute_events(dispute_id, id);
+
+-- 争议头守卫：禁止删除；内容字段冻结，唯一允许的变更是 open -> released
+-- （仅 status 与 released_at 变化）。应用层在持锁事务内完成解除。
+CREATE OR REPLACE FUNCTION play_disputes_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'play disputes must not be deleted; history is immutable';
+    END IF;
+    IF OLD.status = 'open'
+       AND NEW.status = 'released'
+       AND NEW.id IS NOT DISTINCT FROM OLD.id
+       AND NEW.dispute_ref IS NOT DISTINCT FROM OLD.dispute_ref
+       AND NEW.root_import_id IS NOT DISTINCT FROM OLD.root_import_id
+       AND NEW.anchor_import_id IS NOT DISTINCT FROM OLD.anchor_import_id
+       AND NEW.reason IS NOT DISTINCT FROM OLD.reason
+       AND NEW.opened_at IS NOT DISTINCT FROM OLD.opened_at
+       AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'play dispute content is frozen and only open disputes may be released';
+END;
+$$;
+DROP TRIGGER IF EXISTS play_disputes_guarded_trg ON play_disputes;
+CREATE TRIGGER play_disputes_guarded_trg
+    BEFORE UPDATE OR DELETE ON play_disputes
+    FOR EACH ROW EXECUTE FUNCTION play_disputes_guarded();
+
+-- 争议操作记录一经写入即禁止修改/删除
+CREATE OR REPLACE FUNCTION play_dispute_events_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'play dispute events are frozen and must not be ' || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS play_dispute_events_frozen_trg ON play_dispute_events;
+CREATE TRIGGER play_dispute_events_frozen_trg
+    BEFORE UPDATE OR DELETE ON play_dispute_events
+    FOR EACH ROW EXECUTE FUNCTION play_dispute_events_frozen();
+
+-- 待处理快照补充"待处理原因"：no_agreement=缺适用协议（原有口径），
+-- disputed=更正链处于计费争议暂缓（缺协议与争议并存时以争议为先）。
+ALTER TABLE statement_pending
+    ADD COLUMN IF NOT EXISTS reason_code text NOT NULL DEFAULT 'no_agreement';
+ALTER TABLE statement_pending
+    ADD COLUMN IF NOT EXISTS dispute_ref text;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'statement_pending_reason_chk'
+    ) THEN
+        ALTER TABLE statement_pending
+            ADD CONSTRAINT statement_pending_reason_chk
+            CHECK (
+                reason_code IN ('no_agreement', 'disputed')
+                AND (reason_code <> 'disputed' OR dispute_ref IS NOT NULL)
+            );
+    END IF;
+END $$;
+
 -- 权利人余额核对底稿（财务一次性冻结快照）：
 -- 财务凭调用方唯一快照号 snapshot_no 与权利人编号集合 holder_codes
 -- （空集合表示全体已建档权利人）冻结一次核对底稿。同一快照内每位权利人

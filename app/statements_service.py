@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from .allocation import allocate
+from .disputes_service import lock_chain_roots
 from .payments_service import lock_holders_for_billing
 
 # 咨询锁：使用单 bigint 键，高 32 位为服务命名空间、低 32 位为期间键
@@ -22,6 +23,8 @@ def _combined_key(namespace: int, key: int) -> int:
 # 当期"有效播放"：仅更正链链尾参与核算；同时沿 corrects_id 回溯出链的原始编号。
 # 递归从链尾出发向"更原始"方向走，depth 最大处 walk_id 即原始编号（root）。
 # LEFT JOIN 按发生时间匹配协议（协议区间不重叠，最多命中一条）。
+# LEFT JOIN LATERAL 关联该链当前未解除（open）的计费争议：暂缓链整链不计应付
+# （部分唯一索引保证一条链至多一条 open 争议，d 至多命中一行）。
 EFFECTIVE_PLAYS_SQL = """
 WITH RECURSIVE chain AS (
     SELECT import_id AS tail_id, import_id AS walk_id, 0 AS depth
@@ -41,7 +44,8 @@ SELECT
     p.work_code,
     p.occurred_at,
     p.amount,
-    a.id AS agreement_id
+    a.id AS agreement_id,
+    d.dispute_ref AS dispute_ref
 FROM (
     SELECT DISTINCT ON (tail_id) tail_id, walk_id AS root_id
     FROM chain
@@ -51,7 +55,31 @@ JOIN plays p ON p.import_id = ch.tail_id
 LEFT JOIN agreements a
     ON a.work_code = p.work_code
    AND tstzrange(a.valid_from, a.valid_to, '[)') @> p.occurred_at
+LEFT JOIN play_disputes d
+    ON d.root_import_id = ch.root_id AND d.status = 'open'
 ORDER BY p.occurred_at, ch.tail_id
+"""
+
+# 期间内全部参与核算链的原始编号（出单前对这些链根取咨询锁，
+# 与争议的开启/解除串行）。口径与 EFFECTIVE_PLAYS_SQL 的链尾集合一致。
+PERIOD_CHAIN_ROOTS_SQL = """
+WITH RECURSIVE chain AS (
+    SELECT import_id AS tail_id, import_id AS walk_id, 0 AS depth
+    FROM plays p
+    WHERE p.occurred_at >= %s
+      AND p.occurred_at <  %s
+      AND NOT EXISTS (SELECT 1 FROM plays c WHERE c.corrects_id = p.import_id)
+    UNION ALL
+    SELECT ch.tail_id, p.corrects_id, ch.depth + 1
+    FROM chain ch
+    JOIN plays p ON p.import_id = ch.walk_id
+    WHERE p.corrects_id IS NOT NULL AND ch.depth < 10000
+)
+SELECT DISTINCT root_id FROM (
+    SELECT DISTINCT ON (tail_id) tail_id, walk_id AS root_id
+    FROM chain
+    ORDER BY tail_id, depth DESC
+) ch
 """
 
 
@@ -77,6 +105,8 @@ def _pending_payload(rows) -> list[dict]:
             "occurred_at": r["occurred_at"],
             "amount": r["amount"],
             "reason": r["reason"],
+            "reason_code": r["reason_code"],
+            "dispute_ref": r["dispute_ref"],
         }
         for r in rows
     ]
@@ -118,6 +148,24 @@ def compute_current(conn, start: datetime, end: datetime):
     pending: list[dict] = []
     chains: list[dict] = []
     for r in rows:
+        # 计费争议暂缓优先于协议匹配：暂缓作用于整条更正链，
+        # 链尾一律列为"争议待处理"而不计应付（缺协议时也以争议为先）。
+        if r["dispute_ref"] is not None:
+            pending.append(
+                {
+                    "import_id": r["import_id"],
+                    "work_code": r["work_code"],
+                    "occurred_at": r["occurred_at"],
+                    "amount": r["amount"],
+                    "reason": (
+                        f"correction chain is under billing dispute "
+                        f"{r['dispute_ref']}; held pending resolution"
+                    ),
+                    "reason_code": "disputed",
+                    "dispute_ref": r["dispute_ref"],
+                }
+            )
+            continue
         if r["agreement_id"] is None:
             pending.append(
                 {
@@ -126,6 +174,8 @@ def compute_current(conn, start: datetime, end: datetime):
                     "occurred_at": r["occurred_at"],
                     "amount": r["amount"],
                     "reason": "no matching agreement at play occurrence time",
+                    "reason_code": "no_agreement",
+                    "dispute_ref": None,
                 }
             )
             continue
@@ -155,7 +205,8 @@ def compute_current(conn, start: datetime, end: datetime):
 def _load_pending_snapshot(conn, start: datetime, end: datetime):
     rows = conn.execute(
         """
-        SELECT import_id, work_code, occurred_at, amount, reason
+        SELECT import_id, work_code, occurred_at, amount, reason,
+               reason_code, dispute_ref
         FROM statement_pending
         WHERE period_start = %s AND period_end = %s
         ORDER BY occurred_at, import_id
@@ -234,12 +285,14 @@ def _insert_pending_snapshot(conn, start: datetime, end: datetime, pending: list
             cur.executemany(
                 """
                 INSERT INTO statement_pending
-                    (period_start, period_end, import_id, work_code, occurred_at, amount, reason)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (period_start, period_end, import_id, work_code, occurred_at,
+                     amount, reason, reason_code, dispute_ref)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 [
                     (start, end, p["import_id"], p["work_code"], p["occurred_at"],
-                     p["amount"], p["reason"])
+                     p["amount"], p["reason"],
+                     p.get("reason_code", "no_agreement"), p.get("dispute_ref"))
                     for p in pending
                 ],
             )
@@ -456,6 +509,11 @@ def issue_statement(conn, start_in: datetime, end_in: datetime):
             "SELECT pg_advisory_xact_lock(%s::bigint)",
             (_combined_key(ADVISORY_NS, _period_lock_key(key)),),
         )
+
+        # 锁定期间内全部参与核算的更正链根：与争议开启/解除持有的链根锁互斥，
+        # 保证重算所见的争议状态与入账状态一致（不重复出单、不漏算/错算争议链）。
+        root_rows = conn.execute(PERIOD_CHAIN_ROOTS_SQL, (start, end)).fetchall()
+        lock_chain_roots(conn, (r["root_id"] for r in root_rows))
 
         payable, pending, chains = compute_current(conn, start, end)
         _insert_pending_snapshot(conn, start, end, pending)

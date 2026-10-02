@@ -22,6 +22,8 @@ def _combined_key(namespace: int, key: int) -> int:
 # 当期"有效播放"：仅更正链链尾参与核算；同时沿 corrects_id 回溯出链的原始编号。
 # 递归从链尾出发向"更原始"方向走，depth 最大处 walk_id 即原始编号（root）。
 # LEFT JOIN 按发生时间匹配协议（协议区间不重叠，最多命中一条）。
+# LEFT JOIN 未解除争议（每链根至多一条，部分唯一索引保证）：争议状态与播放
+# 在同一语句快照内读取，争议开启/解除与出单并发时基于一致的已提交状态。
 EFFECTIVE_PLAYS_SQL = """
 WITH RECURSIVE chain AS (
     SELECT import_id AS tail_id, import_id AS walk_id, 0 AS depth
@@ -41,7 +43,8 @@ SELECT
     p.work_code,
     p.occurred_at,
     p.amount,
-    a.id AS agreement_id
+    a.id AS agreement_id,
+    d.dispute_ref AS dispute_ref
 FROM (
     SELECT DISTINCT ON (tail_id) tail_id, walk_id AS root_id
     FROM chain
@@ -51,6 +54,9 @@ JOIN plays p ON p.import_id = ch.tail_id
 LEFT JOIN agreements a
     ON a.work_code = p.work_code
    AND tstzrange(a.valid_from, a.valid_to, '[)') @> p.occurred_at
+LEFT JOIN play_disputes d
+    ON d.root_import_id = ch.root_id
+   AND d.status = 'open'
 ORDER BY p.occurred_at, ch.tail_id
 """
 
@@ -83,11 +89,12 @@ def _pending_payload(rows) -> list[dict]:
 
 
 def compute_current(conn, start: datetime, end: datetime):
-    """按当前最新数据（后补协议、更正后的链尾）重算期间。
+    """按当前最新数据（后补协议、更正后的链尾、未解除争议）重算期间。
 
     返回 (payable, pending, chains)：
       payable: holder_code -> 当前应付合计
-      pending: 无匹配协议的链尾播放（待处理，不计入应付）
+      pending: 待处理的链尾播放（未解除争议的链优先按争议列示，
+               其次为无匹配协议的链；均不计入应付）
       chains:  每条参与核算的链的冻结上下文与逐笔分摊，形如
         {
           "root_id", "tail_id", "work_code", "occurred_at", "amount",
@@ -118,6 +125,21 @@ def compute_current(conn, start: datetime, end: datetime):
     pending: list[dict] = []
     chains: list[dict] = []
     for r in rows:
+        # 争议暂缓优先于缺协议：整条更正链挂起，当前链尾列为争议待处理
+        if r["dispute_ref"] is not None:
+            pending.append(
+                {
+                    "import_id": r["import_id"],
+                    "work_code": r["work_code"],
+                    "occurred_at": r["occurred_at"],
+                    "amount": r["amount"],
+                    "reason": (
+                        "billing disputed; correction chain on hold "
+                        f"(dispute {r['dispute_ref']})"
+                    ),
+                }
+            )
+            continue
         if r["agreement_id"] is None:
             pending.append(
                 {

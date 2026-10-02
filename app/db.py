@@ -526,6 +526,102 @@ DROP TRIGGER IF EXISTS balance_snapshot_lines_frozen_trg ON balance_snapshot_lin
 CREATE TRIGGER balance_snapshot_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON balance_snapshot_lines
     FOR EACH ROW EXECUTE FUNCTION balance_snapshots_frozen();
+
+-- 播放争议暂缓（财务对某条更正链的计费依据存疑时登记）：
+-- 财务凭"链内任一播放编号 + 调用方唯一争议号 dispute_ref + 原因"登记暂缓，
+-- 凭争议号解除。争议绑定开启时回溯固化的更正链原始编号 root_import_id
+-- （链根稳定，后续更正只是延长链），因此作用于整条更正链：
+-- 后续更正自动继承争议，试算/出单把"当前链尾"列为争议待处理、不计应付
+-- （缺协议与争议同时成立时以争议为先）；解除后按最新链尾与适用协议恢复。
+--   open     未解除：链挂起，不计应付
+--   released 已解除：终态，链恢复核算；可用新争议号重新开启
+-- dispute_ref 全局唯一：同号同内容重试幂等返回原记录，异内容复用拒绝（409）；
+-- 同一更正链同时最多一条未解除争议（部分唯一索引兜底，应用层在链咨询锁下
+-- 先行判定并给出 dispute_already_open）。
+CREATE TABLE IF NOT EXISTS play_disputes (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dispute_ref    text NOT NULL UNIQUE,
+    -- 开启时回溯固化的更正链原始编号（后续更正不改变链根）
+    root_import_id text NOT NULL,
+    -- 开启时凭据的链内播放编号（幂等"同内容"判定之一）
+    open_import_id text NOT NULL,
+    reason         text NOT NULL,
+    status         text NOT NULL DEFAULT 'open'
+                   CHECK (status IN ('open', 'released')),
+    opened_at      timestamptz NOT NULL DEFAULT now(),
+    released_at    timestamptz,
+    CONSTRAINT play_disputes_released_fields_chk CHECK (
+        status <> 'released' OR released_at IS NOT NULL
+    )
+);
+-- 同一更正链同时最多一条未解除争议（纵深防御；正常路径由链咨询锁保证）
+CREATE UNIQUE INDEX IF NOT EXISTS play_disputes_open_root_uniq
+    ON play_disputes(root_import_id) WHERE status = 'open';
+-- 出单/试算按链根左连接未解除争议的主查询索引
+CREATE INDEX IF NOT EXISTS play_disputes_root_idx
+    ON play_disputes(root_import_id, id);
+
+-- 争议操作记录：开启/解除逐条追加，一经写入不可修改/删除
+CREATE TABLE IF NOT EXISTS play_dispute_events (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dispute_id bigint NOT NULL REFERENCES play_disputes(id),
+    action     text NOT NULL CHECK (action IN ('open', 'release')),
+    note       text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS play_dispute_events_dispute_idx
+    ON play_dispute_events(dispute_id, id);
+
+-- 状态守卫：open 只允许迁移到 released（应用层在持锁事务内完成，同时落
+-- released_at）；released 为终态；内容字段（争议号/链根/凭据编号/原因/
+-- 开启时间）一经写入不可改；任何 DELETE 拒绝（历史不可变）。
+CREATE OR REPLACE FUNCTION play_disputes_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'play disputes must not be deleted; history is immutable';
+    END IF;
+    IF OLD.status = 'released'
+       OR NEW.status NOT IN ('open', 'released')
+       OR NEW.dispute_ref    IS DISTINCT FROM OLD.dispute_ref
+       OR NEW.root_import_id IS DISTINCT FROM OLD.root_import_id
+       OR NEW.open_import_id IS DISTINCT FROM OLD.open_import_id
+       OR NEW.reason         IS DISTINCT FROM OLD.reason
+       OR NEW.opened_at      IS DISTINCT FROM OLD.opened_at
+       OR NEW.id             IS DISTINCT FROM OLD.id THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'play dispute ' || OLD.status
+                      || ' is terminal and content must not change';
+    END IF;
+    IF NEW.status = 'released' AND NEW.released_at IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'check_violation',
+            MESSAGE = 'released play dispute must carry released_at';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS play_disputes_guarded_trg ON play_disputes;
+CREATE TRIGGER play_disputes_guarded_trg
+    BEFORE UPDATE OR DELETE ON play_disputes
+    FOR EACH ROW EXECUTE FUNCTION play_disputes_guarded();
+
+CREATE OR REPLACE FUNCTION play_dispute_events_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'play dispute operation log is frozen and must not be '
+                  || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS play_dispute_events_frozen_trg ON play_dispute_events;
+CREATE TRIGGER play_dispute_events_frozen_trg
+    BEFORE UPDATE OR DELETE ON play_dispute_events
+    FOR EACH ROW EXECUTE FUNCTION play_dispute_events_frozen();
 """
 
 

@@ -627,5 +627,45 @@ class BalanceSnapshotPage(BaseModel):
     totals: BalanceSnapshotTotals
 
 
+# ---- 播放争议暂缓 ----
+
+class DisputeOpenIn(BaseModel):
+    # 链内任一播放编号（开启时回溯到更正链原始编号，争议作用于整条链）
+    import_id: str = Field(min_length=1, max_length=200)
+    # 调用方唯一争议号（全局唯一；同号同内容重试幂等、异内容 409）
+    dispute_ref: str = Field(min_length=1, max_length=200)
+    # 争议原因（计费依据存疑说明）
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class DisputeEventOut(BaseModel):
+    # open=登记暂缓；release=解除
+    action: str
+    # 开启时回显争议原因；解除为 None
+    note: str | None = None
+    created_at: datetime
+
+
+class DisputeOut(BaseModel):
+    dispute_id: int
+    dispute_ref: str
+    # 更正链原始编号（开启时回溯固化，后续更正不改变）
+    root_import_id: str
+    # 开启时凭据的链内播放编号
+    open_import_id: str
+    # 当前链尾（后续更正自动继承争议，链尾随之前移）
+    tail_import_id: str
+    reason: str
+    # 请求级状态：created=新开启；duplicate=同号同内容重试/重复解除；
+    # released=本次解除；查询时即争议自身状态（open/released）
+    status: str
+    # 争议自身状态：open=未解除（链挂起）；released=已解除（终态）
+    dispute_status: str
+    opened_at: datetime
+    released_at: datetime | None = None
+    # 操作记录（开启/解除逐条追加，不可改写）
+    events: list[DisputeEventOut]
+
+
 # 解析 HolderLedger 中对 LedgerInstructionItem 的前向引用
 HolderLedger.model_rebuild()

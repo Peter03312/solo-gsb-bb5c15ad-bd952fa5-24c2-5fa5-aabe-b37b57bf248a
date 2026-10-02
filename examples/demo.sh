@@ -385,4 +385,42 @@ $C -X POST "$BASE/balance-snapshots" -H 'Content-Type: application/json' \
 $C "$BASE/balance-snapshots/BAL-DEMO-ALL?page=1&page_size=2" | python3 -m json.tool
 $C -i "$BASE/balance-snapshots/NO-SUCH-SNAP" | head -1   # 404 balance_snapshot_not_found
 
+say "46) 播放争议暂缓：凭链内任一编号 + 唯一争议号 + 原因登记（作用于整条更正链）"
+# 承上 PLAY-1001 链（链尾 PLAY-1001-R2，2 月已出单 19/9/2）
+$C -X POST "$BASE/plays/disputes" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-1001-R2","dispute_ref":"DSP-2026-0001","reason":"计费依据存疑：金额与平台账单不符"}' | python3 -m json.tool
+# 同号同内容重试 => 200 duplicate；同号异内容 => 409 dispute_ref_conflict
+$C -i -X POST "$BASE/plays/disputes" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-1001-R2","dispute_ref":"DSP-2026-0001","reason":"计费依据存疑：金额与平台账单不符"}' | head -1
+$C -i -X POST "$BASE/plays/disputes" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-1001-R2","dispute_ref":"DSP-2026-0001","reason":"另一个原因"}' | head -1
+# 同链重复开启（凭链根编号同样命中）=> 409 dispute_already_open；未知播放 => 404
+$C -i -X POST "$BASE/plays/disputes" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-1001","dispute_ref":"DSP-2026-0002","reason":"重复登记"}' | head -1
+$C -i -X POST "$BASE/plays/disputes" -H 'Content-Type: application/json' \
+  -d '{"import_id":"NO-SUCH-PLAY","dispute_ref":"DSP-2026-X","reason":"x"}' | head -1
+
+say "47) 暂缓期间：试算/出单把当前链尾列为争议待处理、不计应付；再出单按追补规则撤销该链已计金额"
+$C "$BASE/statements/preview?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" | python3 -m json.tool
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | python3 -m json.tool
+# 暂缓期间更正 => 新链尾自动继承争议（查询显示当前链尾已前移）
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-1001-R3","work_code":"W-LIVE-001","occurred_at":"2026-02-10T20:00:00+08:00","amount":60,"corrects_id":"PLAY-1001-R2"}'; echo
+$C "$BASE/plays/disputes/DSP-2026-0001" | python3 -m json.tool
+
+say "48) 解除：凭争议号；重复解除幂等；解除后按最新链尾与适用协议恢复核算（再出单补回）"
+$C -X POST "$BASE/plays/disputes/DSP-2026-0001/release" | python3 -m json.tool
+$C -X POST "$BASE/plays/disputes/DSP-2026-0001/release" | python3 -m json.tool
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | python3 -m json.tool
+# 解除后可用新争议号重开；旧争议号同内容重试只返回原已解除记录（不重开）
+$C -X POST "$BASE/plays/disputes" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-1001-R3","dispute_ref":"DSP-2026-0003","reason":"新一轮核查"}' | python3 -m json.tool
+$C -i -X POST "$BASE/plays/disputes" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-1001-R2","dispute_ref":"DSP-2026-0001","reason":"计费依据存疑：金额与平台账单不符"}' | head -1
+$C -X POST "$BASE/plays/disputes/DSP-2026-0003/release" | python3 -m json.tool
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | python3 -m json.tool
+
 say "完成"
